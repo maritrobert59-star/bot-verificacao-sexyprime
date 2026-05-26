@@ -1,12 +1,13 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import re
 from datetime import datetime
 from typing import Final
 
-from aiohttp import web
+from aiohttp import ClientSession, web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -28,6 +29,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 LOG_GROUP_ID: Final[int] = -1003754061774
 SUPPORT_URL: Final[str] = "https://t.me/SXP_suporte"
 WEBHOOK_PATH: Final[str] = "/telegram-webhook"
+SXP_SITE_URL: Final[str] = os.getenv("SXP_SITE_URL", "").rstrip("/")
+SXP_REFERRAL_SECRET: Final[str] = os.getenv("SXP_REFERRAL_SECRET", "")
 
 TERMS, GENERO, DATA, FOTO, VIDEO = range(5)
 
@@ -185,11 +188,64 @@ def admin_name(user) -> str:
     return f"admin {user.id}"
 
 
+def extract_referral_code(context: ContextTypes.DEFAULT_TYPE) -> str:
+    if not context.args:
+        return ""
+
+    raw = str(context.args[0]).strip()
+    if raw.startswith("ref_"):
+        raw = raw[4:]
+
+    raw = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+    return raw[:32]
+
+
+async def notify_site_referral_conversion(context: ContextTypes.DEFAULT_TYPE, user_id: int, full_name: str, username: str, referral_code: str) -> None:
+    if not referral_code:
+        return
+
+    if not SXP_SITE_URL or not SXP_REFERRAL_SECRET:
+        logger.warning("Indicação detectada, mas SXP_SITE_URL ou SXP_REFERRAL_SECRET não estão configurados.")
+        return
+
+    payload = {
+        "secret": SXP_REFERRAL_SECRET,
+        "code": referral_code,
+        "telegram_user_id": str(user_id),
+        "full_name": full_name,
+        "username": username,
+        "source": "telegram_verification_bot",
+    }
+
+    try:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{SXP_SITE_URL}/api/referral_conversion.php",
+                json=payload,
+                timeout=25,
+            ) as response:
+                text = await response.text()
+                if response.status >= 400:
+                    logger.error(f"Erro ao registrar indicação no site: HTTP {response.status} | {text}")
+                    return
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = {"raw": text}
+                logger.info(f"Retorno da indicação: {data}")
+    except Exception as e:
+        logger.error(f"Falha ao chamar API de indicação: {e}")
+
+
 # =========================
 # START
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
+
+    referral_code = extract_referral_code(context)
+    if referral_code:
+        context.user_data["referral_code"] = referral_code
 
     user = update.effective_user
     nome = user.first_name if user and user.first_name else "modelo"
@@ -199,6 +255,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "🔒 <b>Verificação Oficial — Sexy Prime</b>\n\n"
             f"Seja bem-vinda <b>{esc(nome)}</b> ao bot de verificação da agência <b>Sexy Prime</b>.\n\n"
             "Este é o primeiro passo para sua oficialização em nossa agência."
+            + (f"\n\n🎁 <b>Indicação recebida:</b> <code>{esc(referral_code)}</code>" if referral_code else "")
         ),
         reply_markup=start_keyboard(),
         parse_mode=ParseMode.HTML,
@@ -340,6 +397,7 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
     age = context.user_data.get("age", "não informado")
     gender = context.user_data.get("gender", "não informado")
     username = f"@{user.username}" if user.username else "sem @username"
+    referral_code = context.user_data.get("referral_code", "")
 
     try:
         await context.bot.send_message(
@@ -411,6 +469,7 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
     age = context.user_data.get("age", "não informado")
     gender = context.user_data.get("gender", "não informado")
     username = f"@{user.username}" if user.username else "sem @username"
+    referral_code = context.user_data.get("referral_code", "")
 
     try:
         await context.bot.send_video(
@@ -423,7 +482,8 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
                 f"<b>ID:</b> <code>{user.id}</code>\n"
                 f"<b>Gênero:</b> {esc(gender)}\n"
                 f"<b>Data de nascimento:</b> <code>{esc(birth_date)}</code>\n"
-                f"<b>Idade:</b> {esc(age)} anos\n\n"
+                f"<b>Idade:</b> {esc(age)} anos\n"
+                f"<b>Indicação:</b> {esc(referral_code) if referral_code else 'sem indicação'}\n\n"
                 "<b>Ação:</b> escolha abaixo se deseja aprovar ou rejeitar."
             ),
             parse_mode=ParseMode.HTML,
@@ -434,6 +494,15 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
         )
     except Exception as e:
         logger.error(f"Erro ao enviar vídeo para o grupo: {e}")
+
+
+    if referral_code:
+        context.application.bot_data[f"referral_{user.id}"] = {
+            "code": referral_code,
+            "full_name": user.full_name or "",
+            "username": f"@{user.username}" if user.username else "",
+            "created_at": datetime.now().isoformat(),
+        }
 
     await update.message.reply_text(
         text=(
@@ -487,6 +556,18 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.HTML,
                 reply_markup=support_keyboard(),
             )
+
+
+            referral_info = context.application.bot_data.pop(f"referral_{user_id}", {})
+            referral_code = str(referral_info.get("code", ""))
+            if referral_code:
+                await notify_site_referral_conversion(
+                    context=context,
+                    user_id=user_id,
+                    full_name=str(referral_info.get("full_name", "")),
+                    username=str(referral_info.get("username", "")),
+                    referral_code=referral_code,
+                )
 
             processed_text = (
                 "<b>Solicitação processada</b>\n\n"

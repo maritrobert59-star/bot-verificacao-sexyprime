@@ -32,7 +32,7 @@ WEBHOOK_PATH: Final[str] = "/telegram-webhook"
 SXP_SITE_URL: Final[str] = os.getenv("SXP_SITE_URL", "").rstrip("/")
 SXP_REFERRAL_SECRET: Final[str] = os.getenv("SXP_REFERRAL_SECRET", "")
 
-TERMS, GENERO, DATA, FOTO, VIDEO = range(5)
+TERMS, INDICACAO, GENERO, DATA, FOTO, VIDEO = range(6)
 
 DATE_REGEX: Final[re.Pattern[str]] = re.compile(
     r"^(0[1-9]|[12][0-9]|3[01])/(0[1-9]|1[0-2])/\d{4}$"
@@ -124,6 +124,27 @@ def terms_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def referral_question_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Sim, tenho código", callback_data="referral_yes")],
+        [InlineKeyboardButton("Não tenho código", callback_data="referral_no")],
+    ])
+
+
+def referral_skip_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Não tenho código", callback_data="referral_no")],
+    ])
+
+
+def clean_referral_code(raw: object) -> str:
+    raw = str(raw or "").strip()
+    raw = raw.replace("/start", "")
+    raw = raw.replace("ref_", "")
+    raw = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+    return raw[:32]
+
+
 def gender_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -192,12 +213,51 @@ def extract_referral_code(context: ContextTypes.DEFAULT_TYPE) -> str:
     if not context.args:
         return ""
 
-    raw = str(context.args[0]).strip()
-    if raw.startswith("ref_"):
-        raw = raw[4:]
+    return clean_referral_code(context.args[0])
 
-    raw = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
-    return raw[:32]
+
+async def notify_site_referral_access(context: ContextTypes.DEFAULT_TYPE, user_id: int, full_name: str, username: str, referral_code: str) -> tuple[bool, str]:
+    referral_code = clean_referral_code(referral_code)
+
+    if not referral_code:
+        return False, "Código inválido."
+
+    if not SXP_SITE_URL or not SXP_REFERRAL_SECRET:
+        logger.warning("Código de indicação informado, mas SXP_SITE_URL ou SXP_REFERRAL_SECRET não estão configurados.")
+        return False, "Sistema de indicação temporariamente indisponível."
+
+    payload = {
+        "secret": SXP_REFERRAL_SECRET,
+        "code": referral_code,
+        "telegram_user_id": str(user_id),
+        "full_name": full_name,
+        "username": username,
+        "source": "telegram_verification_bot_manual_code",
+    }
+
+    try:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{SXP_SITE_URL}/api/referral_access.php",
+                json=payload,
+                timeout=25,
+            ) as response:
+                text = await response.text()
+
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = {"success": False, "message": text}
+
+                if response.status >= 400 or not data.get("success"):
+                    logger.warning(f"Código de indicação recusado pelo site: HTTP {response.status} | {data}")
+                    return False, str(data.get("message") or "Código não encontrado ou inativo.")
+
+                logger.info(f"Acesso de indicação registrado: {data}")
+                return True, str(data.get("message") or "Indicação registrada.")
+    except Exception as e:
+        logger.error(f"Falha ao registrar acesso de indicação: {e}")
+        return False, "Não consegui validar o código agora. Tente novamente ou continue sem código."
 
 
 async def notify_site_referral_conversion(context: ContextTypes.DEFAULT_TYPE, user_id: int, full_name: str, username: str, referral_code: str) -> None:
@@ -295,6 +355,116 @@ async def show_terms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     return TERMS
+
+
+# =========================
+# INDICAÇÃO MANUAL
+# =========================
+async def ask_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    start_referral_code = context.user_data.get("referral_code", "")
+    extra = ""
+
+    if start_referral_code:
+        extra = (
+            "\n\n<b>Detectamos um código no seu link:</b> "
+            f"<code>{esc(start_referral_code)}</code>\n"
+            "Se esse código estiver correto, você também pode colar ele abaixo."
+        )
+
+    await query.edit_message_text(
+        text=(
+            "🎁 <b>Veio por indicação?</b>\n\n"
+            "Se alguma modelo da Sexy Prime te convidou, toque em <b>Sim, tenho código</b> "
+            "e cole o código de indicação dela.\n\n"
+            "Se você não tem código, toque em <b>Não tenho código</b> para continuar."
+            f"{extra}"
+        ),
+        reply_markup=referral_question_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+
+    save_step_message_id_from_query(update, context)
+    return INDICACAO
+
+
+async def referral_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        text=(
+            "🎁 <b>Código de indicação</b>\n\n"
+            "Digite ou cole o código que a modelo te enviou.\n\n"
+            "Exemplo:\n"
+            "<code>A7K9P2XQ</code>"
+        ),
+        reply_markup=referral_skip_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+
+    save_step_message_id_from_query(update, context)
+    return INDICACAO
+
+
+async def referral_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("referral_code", None)
+    return await ask_gender(update, context)
+
+
+async def receive_referral_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    code = clean_referral_code(update.message.text)
+
+    if not code or len(code) < 4:
+        await update.message.reply_text(
+            text=(
+                "Código inválido. Envie somente o código de indicação ou toque em "
+                "<b>Não tenho código</b>."
+            ),
+            reply_markup=referral_skip_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return INDICACAO
+
+    user = update.effective_user
+    ok, message = await notify_site_referral_access(
+        context=context,
+        user_id=user.id,
+        full_name=user.full_name or "",
+        username=f"@{user.username}" if user.username else "",
+        referral_code=code,
+    )
+
+    if not ok:
+        await update.message.reply_text(
+            text=(
+                "❌ <b>Não consegui registrar esse código.</b>\n\n"
+                f"{esc(message)}\n\n"
+                "Confira o código e envie novamente, ou toque em <b>Não tenho código</b>."
+            ),
+            reply_markup=referral_skip_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return INDICACAO
+
+    context.user_data["referral_code"] = code
+    schedule_pending_reminder(update, context)
+
+    msg = await update.message.reply_text(
+        text=(
+            "✅ <b>Indicação registrada com sucesso.</b>\n\n"
+            f"Código usado: <code>{esc(code)}</code>\n\n"
+            "🚻 <b>Etapa 1 de 4 — Selecione seu gênero</b>\n\n"
+            "Escolha uma das opções abaixo para continuar sua verificação."
+        ),
+        reply_markup=gender_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+
+    context.user_data["last_step_message_id"] = msg.message_id
+    return GENERO
 
 
 # =========================
@@ -410,6 +580,7 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
                 f"<b>Gênero:</b> {esc(gender)}\n"
                 f"<b>Data de nascimento:</b> <code>{esc(birth_date)}</code>\n"
                 f"<b>Idade:</b> {esc(age)} anos\n"
+                f"<b>Indicação:</b> {esc(referral_code) if referral_code else 'sem indicação'}\n"
                 "<b>Etapa recebida:</b> Documento"
             ),
             parse_mode=ParseMode.HTML,
@@ -652,7 +823,12 @@ async def main():
         states={
             TERMS: [
                 CallbackQueryHandler(show_terms, pattern="^start_verification$"),
-                CallbackQueryHandler(ask_gender, pattern="^agree_terms$"),
+                CallbackQueryHandler(ask_referral, pattern="^agree_terms$"),
+            ],
+            INDICACAO: [
+                CallbackQueryHandler(referral_yes, pattern="^referral_yes$"),
+                CallbackQueryHandler(referral_no, pattern="^referral_no$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_referral_code),
             ],
             GENERO: [
                 CallbackQueryHandler(receive_gender, pattern=r"^gender_.+"),

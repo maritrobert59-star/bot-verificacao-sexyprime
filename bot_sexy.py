@@ -1,5 +1,6 @@
 import asyncio
 import html
+import io
 import json
 import logging
 import os
@@ -7,7 +8,8 @@ import re
 from datetime import datetime
 from typing import Final
 
-from aiohttp import ClientSession, web
+from aiohttp import web
+from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -29,10 +31,18 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 LOG_GROUP_ID: Final[int] = -1003754061774
 SUPPORT_URL: Final[str] = "https://t.me/SXP_suporte"
 WEBHOOK_PATH: Final[str] = "/telegram-webhook"
-SXP_SITE_URL: Final[str] = os.getenv("SXP_SITE_URL", "").rstrip("/")
-SXP_REFERRAL_SECRET: Final[str] = os.getenv("SXP_REFERRAL_SECRET", "")
+BLOCKED_USERS_FILE: Final[str] = os.getenv("BLOCKED_USERS_FILE", "blocked_users.json")
+ADMINS_FILE: Final[str] = os.getenv("ADMINS_FILE", "admins.json")
+AUTO_BLOCK_EXPLICIT_DOCUMENT: Final[bool] = os.getenv("AUTO_BLOCK_EXPLICIT_DOCUMENT", "1") == "1"
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = {int(admin_id.strip()) for admin_id in ADMIN_IDS_RAW.split(",") if admin_id.strip().isdigit()}
 
-TERMS, INDICACAO, GENERO, DATA, FOTO, VIDEO = range(6)
+# Custom emojis premium: coloque IDs reais do Telegram nas ENV se quiser usar depois.
+# Sem custom_emoji_id real, o bot usa emojis normais para não quebrar o envio.
+PREMIUM_EMOJI_OK = os.getenv("PREMIUM_EMOJI_OK", "")
+PREMIUM_EMOJI_LOCK = os.getenv("PREMIUM_EMOJI_LOCK", "")
+
+TERMS, GENERO, DATA, FOTO, VIDEO = range(5)
 
 DATE_REGEX: Final[re.Pattern[str]] = re.compile(
     r"^(0[1-9]|[12][0-9]|3[01])/(0[1-9]|1[0-2])/\d{4}$"
@@ -52,6 +62,196 @@ logger = logging.getLogger(__name__)
 # =========================
 def esc(text: object) -> str:
     return html.escape(str(text))
+
+
+def html_link(label: str, url: str) -> str:
+    # Telegram não permite escolher cor do link; a cor vem do app do usuário.
+    # Esse helper cria URL clicável com HTML seguro.
+    return f'<a href="{esc(url)}">{esc(label)}</a>'
+
+
+def looks_like_explicit_or_nude_image(image_bytes: bytes) -> bool:
+    """Detector local simples para bloquear imagens com muita pele.
+
+    Não substitui IA profissional, mas ajuda a barrar nudez/genitália óbvia enviada no lugar do documento.
+    Foi deixado conservador para reduzir falso positivo em RG/CNH com rosto.
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image.thumbnail((320, 320))
+        pixels = list(image.getdata())
+        if not pixels:
+            return False
+
+        skin_pixels = 0
+        for r, g, b in pixels:
+            max_rgb = max(r, g, b)
+            min_rgb = min(r, g, b)
+            # Regra clássica aproximada de tom de pele em RGB.
+            if r > 95 and g > 40 and b > 20 and (max_rgb - min_rgb) > 15 and abs(r - g) > 15 and r > g and r > b:
+                skin_pixels += 1
+
+        skin_ratio = skin_pixels / len(pixels)
+        return skin_ratio >= 0.42
+    except Exception as e:
+        logger.error(f"Erro ao analisar possível nudez/documento: {e}")
+        return False
+
+
+def looks_like_document_image(image_bytes: bytes) -> bool:
+    """Validação local básica de documento.
+
+    Sem API externa/OCR, nenhum bot consegue garantir 100% que é RG/CNH.
+    Aqui barramos imagens muito pequenas/estranhas; documentos reais normalmente passam.
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        width, height = image.size
+        if width < 350 or height < 220:
+            return False
+
+        ratio = width / height if height else 0
+        inverse_ratio = height / width if width else 0
+
+        # Aceita foto de documento em paisagem/retrato, inclusive foto tirada pelo celular.
+        return 0.45 <= ratio <= 2.35 or 0.45 <= inverse_ratio <= 2.35
+    except Exception as e:
+        logger.error(f"Erro ao validar imagem de documento: {e}")
+        return False
+
+
+async def download_photo_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
+    telegram_file = await context.bot.get_file(file_id)
+    data = await telegram_file.download_as_bytearray(
+        read_timeout=60,
+        write_timeout=60,
+        connect_timeout=60,
+    )
+    return bytes(data)
+
+
+def load_blocked_users() -> dict:
+    try:
+        with open(BLOCKED_USERS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.error(f"Erro ao carregar lista de bloqueados: {e}")
+        return {}
+
+
+def save_blocked_users(blocked_users: dict) -> None:
+    try:
+        with open(BLOCKED_USERS_FILE, "w", encoding="utf-8") as file:
+            json.dump(blocked_users, file, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Erro ao salvar lista de bloqueados: {e}")
+
+
+def load_extra_admins() -> set[int]:
+    try:
+        with open(ADMINS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            if isinstance(data, list):
+                return {int(item) for item in data if str(item).isdigit()}
+            return set()
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        logger.error(f"Erro ao carregar admins extras: {e}")
+        return set()
+
+
+def save_extra_admins(admins: set[int]) -> None:
+    try:
+        with open(ADMINS_FILE, "w", encoding="utf-8") as file:
+            json.dump(sorted(admins), file, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Erro ao salvar admins extras: {e}")
+
+
+def all_admin_ids() -> set[int]:
+    return set(ADMIN_IDS) | load_extra_admins()
+
+
+def add_admin(user_id: int) -> None:
+    admins = load_extra_admins()
+    admins.add(user_id)
+    save_extra_admins(admins)
+
+
+def remove_admin(user_id: int) -> bool:
+    admins = load_extra_admins()
+    if user_id not in admins:
+        return False
+    admins.remove(user_id)
+    save_extra_admins(admins)
+    return True
+
+
+def is_user_blocked(user_id: int) -> bool:
+    return str(user_id) in load_blocked_users()
+
+
+def block_user(user_id: int, reason: str, admin_user) -> None:
+    blocked_users = load_blocked_users()
+    blocked_users[str(user_id)] = {
+        "reason": reason,
+        "blocked_by": admin_name(admin_user),
+        "blocked_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+    }
+    save_blocked_users(blocked_users)
+
+
+def unblock_user(user_id: int) -> bool:
+    blocked_users = load_blocked_users()
+
+    if str(user_id) not in blocked_users:
+        return False
+
+    blocked_users.pop(str(user_id), None)
+    save_blocked_users(blocked_users)
+    return True
+
+
+def is_admin_user(user) -> bool:
+    admins = all_admin_ids()
+    if not admins:
+        return True
+    return user and user.id in admins
+
+
+async def notify_blocked_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "🚫 <b>Seu acesso ao bot foi bloqueado pela administração.</b>"
+
+    if update.callback_query:
+        await update.callback_query.answer("Seu acesso ao bot foi bloqueado.", show_alert=True)
+        try:
+            await update.callback_query.edit_message_text(text=text, parse_mode=ParseMode.HTML)
+        except Exception:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+    elif update.message:
+        await update.message.reply_text(text=text, parse_mode=ParseMode.HTML)
+
+
+def blocked_guard(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+
+        if user and is_user_blocked(user.id):
+            await notify_blocked_access(update, context)
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        return await func(update, context, *args, **kwargs)
+
+    return wrapper
 
 
 async def delete_last_step_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -124,27 +324,6 @@ def terms_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def referral_question_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Sim, tenho código", callback_data="referral_yes")],
-        [InlineKeyboardButton("Não tenho código", callback_data="referral_no")],
-    ])
-
-
-def referral_skip_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Não tenho código", callback_data="referral_no")],
-    ])
-
-
-def clean_referral_code(raw: object) -> str:
-    raw = str(raw or "").strip()
-    raw = raw.replace("/start", "")
-    raw = raw.replace("ref_", "")
-    raw = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
-    return raw[:32]
-
-
 def gender_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -175,7 +354,10 @@ def approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("✅ Aprovar", callback_data=f"approve_{user_id}"),
             InlineKeyboardButton("❌ Rejeitar", callback_data=f"reject_{user_id}"),
-        ]
+        ],
+        [
+            InlineKeyboardButton("🚫 Bloquear", callback_data=f"block_{user_id}"),
+        ],
     ])
 
 
@@ -209,103 +391,12 @@ def admin_name(user) -> str:
     return f"admin {user.id}"
 
 
-def extract_referral_code(context: ContextTypes.DEFAULT_TYPE) -> str:
-    if not context.args:
-        return ""
-
-    return clean_referral_code(context.args[0])
-
-
-async def notify_site_referral_access(context: ContextTypes.DEFAULT_TYPE, user_id: int, full_name: str, username: str, referral_code: str) -> tuple[bool, str]:
-    referral_code = clean_referral_code(referral_code)
-
-    if not referral_code:
-        return False, "Código inválido."
-
-    if not SXP_SITE_URL or not SXP_REFERRAL_SECRET:
-        logger.warning("Código de indicação informado, mas SXP_SITE_URL ou SXP_REFERRAL_SECRET não estão configurados.")
-        return False, "Sistema de indicação temporariamente indisponível."
-
-    payload = {
-        "secret": SXP_REFERRAL_SECRET,
-        "code": referral_code,
-        "telegram_user_id": str(user_id),
-        "full_name": full_name,
-        "username": username,
-        "source": "telegram_verification_bot_manual_code",
-    }
-
-    try:
-        async with ClientSession() as session:
-            async with session.post(
-                f"{SXP_SITE_URL}/api/referral_access.php",
-                json=payload,
-                timeout=25,
-            ) as response:
-                text = await response.text()
-
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    data = {"success": False, "message": text}
-
-                if response.status >= 400 or not data.get("success"):
-                    logger.warning(f"Código de indicação recusado pelo site: HTTP {response.status} | {data}")
-                    return False, str(data.get("message") or "Código não encontrado ou inativo.")
-
-                logger.info(f"Acesso de indicação registrado: {data}")
-                return True, str(data.get("message") or "Indicação registrada.")
-    except Exception as e:
-        logger.error(f"Falha ao registrar acesso de indicação: {e}")
-        return False, "Não consegui validar o código agora. Tente novamente ou continue sem código."
-
-
-async def notify_site_referral_conversion(context: ContextTypes.DEFAULT_TYPE, user_id: int, full_name: str, username: str, referral_code: str) -> None:
-    if not referral_code:
-        return
-
-    if not SXP_SITE_URL or not SXP_REFERRAL_SECRET:
-        logger.warning("Indicação detectada, mas SXP_SITE_URL ou SXP_REFERRAL_SECRET não estão configurados.")
-        return
-
-    payload = {
-        "secret": SXP_REFERRAL_SECRET,
-        "code": referral_code,
-        "telegram_user_id": str(user_id),
-        "full_name": full_name,
-        "username": username,
-        "source": "telegram_verification_bot",
-    }
-
-    try:
-        async with ClientSession() as session:
-            async with session.post(
-                f"{SXP_SITE_URL}/api/referral_conversion.php",
-                json=payload,
-                timeout=25,
-            ) as response:
-                text = await response.text()
-                if response.status >= 400:
-                    logger.error(f"Erro ao registrar indicação no site: HTTP {response.status} | {text}")
-                    return
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    data = {"raw": text}
-                logger.info(f"Retorno da indicação: {data}")
-    except Exception as e:
-        logger.error(f"Falha ao chamar API de indicação: {e}")
-
-
 # =========================
 # START
 # =========================
+@blocked_guard
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-
-    referral_code = extract_referral_code(context)
-    if referral_code:
-        context.user_data["referral_code"] = referral_code
 
     user = update.effective_user
     nome = user.first_name if user and user.first_name else "modelo"
@@ -315,7 +406,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "🔒 <b>Verificação Oficial — Sexy Prime</b>\n\n"
             f"Seja bem-vinda <b>{esc(nome)}</b> ao bot de verificação da agência <b>Sexy Prime</b>.\n\n"
             "Este é o primeiro passo para sua oficialização em nossa agência."
-            + (f"\n\n🎁 <b>Indicação recebida:</b> <code>{esc(referral_code)}</code>" if referral_code else "")
         ),
         reply_markup=start_keyboard(),
         parse_mode=ParseMode.HTML,
@@ -327,6 +417,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # =========================
 # TERMOS
 # =========================
+@blocked_guard
 async def show_terms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -358,118 +449,9 @@ async def show_terms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 # =========================
-# INDICAÇÃO MANUAL
-# =========================
-async def ask_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    start_referral_code = context.user_data.get("referral_code", "")
-    extra = ""
-
-    if start_referral_code:
-        extra = (
-            "\n\n<b>Detectamos um código no seu link:</b> "
-            f"<code>{esc(start_referral_code)}</code>\n"
-            "Se esse código estiver correto, você também pode colar ele abaixo."
-        )
-
-    await query.edit_message_text(
-        text=(
-            "🎁 <b>Veio por indicação?</b>\n\n"
-            "Se alguma modelo da Sexy Prime te convidou, toque em <b>Sim, tenho código</b> "
-            "e cole o código de indicação dela.\n\n"
-            "Se você não tem código, toque em <b>Não tenho código</b> para continuar."
-            f"{extra}"
-        ),
-        reply_markup=referral_question_keyboard(),
-        parse_mode=ParseMode.HTML,
-    )
-
-    save_step_message_id_from_query(update, context)
-    return INDICACAO
-
-
-async def referral_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    await query.edit_message_text(
-        text=(
-            "🎁 <b>Código de indicação</b>\n\n"
-            "Digite ou cole o código que a modelo te enviou.\n\n"
-            "Exemplo:\n"
-            "<code>A7K9P2XQ</code>"
-        ),
-        reply_markup=referral_skip_keyboard(),
-        parse_mode=ParseMode.HTML,
-    )
-
-    save_step_message_id_from_query(update, context)
-    return INDICACAO
-
-
-async def referral_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("referral_code", None)
-    return await ask_gender(update, context)
-
-
-async def receive_referral_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    code = clean_referral_code(update.message.text)
-
-    if not code or len(code) < 4:
-        await update.message.reply_text(
-            text=(
-                "Código inválido. Envie somente o código de indicação ou toque em "
-                "<b>Não tenho código</b>."
-            ),
-            reply_markup=referral_skip_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
-        return INDICACAO
-
-    user = update.effective_user
-    ok, message = await notify_site_referral_access(
-        context=context,
-        user_id=user.id,
-        full_name=user.full_name or "",
-        username=f"@{user.username}" if user.username else "",
-        referral_code=code,
-    )
-
-    if not ok:
-        await update.message.reply_text(
-            text=(
-                "❌ <b>Não consegui registrar esse código.</b>\n\n"
-                f"{esc(message)}\n\n"
-                "Confira o código e envie novamente, ou toque em <b>Não tenho código</b>."
-            ),
-            reply_markup=referral_skip_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
-        return INDICACAO
-
-    context.user_data["referral_code"] = code
-    schedule_pending_reminder(update, context)
-
-    msg = await update.message.reply_text(
-        text=(
-            "✅ <b>Indicação registrada com sucesso.</b>\n\n"
-            f"Código usado: <code>{esc(code)}</code>\n\n"
-            "🚻 <b>Etapa 1 de 4 — Selecione seu gênero</b>\n\n"
-            "Escolha uma das opções abaixo para continuar sua verificação."
-        ),
-        reply_markup=gender_keyboard(),
-        parse_mode=ParseMode.HTML,
-    )
-
-    context.user_data["last_step_message_id"] = msg.message_id
-    return GENERO
-
-
-# =========================
 # GÊNERO
 # =========================
+@blocked_guard
 async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -489,6 +471,7 @@ async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return GENERO
 
 
+@blocked_guard
 async def receive_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -515,6 +498,7 @@ async def receive_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # =========================
 # DATA
 # =========================
+@blocked_guard
 async def receive_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     date_text = update.message.text.strip()
 
@@ -546,6 +530,7 @@ async def receive_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return FOTO
 
 
+@blocked_guard
 async def invalid_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "Formato inválido. Por favor, envie sua data como no exemplo: 01/01/2000",
@@ -557,17 +542,66 @@ async def invalid_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # =========================
 # FOTO DOCUMENTO
 # =========================
+@blocked_guard
 async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     photo = update.message.photo[-1]
+    user = update.effective_user
+
+    try:
+        image_bytes = await download_photo_bytes(context, photo.file_id)
+
+        if looks_like_explicit_or_nude_image(image_bytes):
+            if AUTO_BLOCK_EXPLICIT_DOCUMENT:
+                block_user(
+                    user_id=user.id,
+                    reason="Envio de imagem explícita/inadequada na etapa de documento.",
+                    admin_user=user,
+                )
+                cancel_pending_reminder(context)
+                context.user_data.clear()
+
+                try:
+                    await context.bot.send_message(
+                        chat_id=LOG_GROUP_ID,
+                        text=(
+                            "🚫 <b>Usuário bloqueado automaticamente</b>\n\n"
+                            f"<b>Nome:</b> {esc(user.full_name)}\n"
+                            f"<b>ID:</b> <code>{user.id}</code>\n"
+                            "<b>Motivo:</b> imagem explícita/inadequada enviada na etapa de documento."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as e:
+                    logger.error(f"Erro ao avisar grupo sobre bloqueio automático: {e}")
+
+                await update.message.reply_text(
+                    "🚫 <b>Seu acesso ao bot foi bloqueado pela administração.</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return ConversationHandler.END
+
+            await update.message.reply_text(
+                "🚫 <b>A imagem enviada não é aceita como documento.</b>\n\nEnvie uma foto legível do seu documento oficial com foto.",
+                parse_mode=ParseMode.HTML,
+            )
+            return FOTO
+
+        if not looks_like_document_image(image_bytes):
+            await update.message.reply_text(
+                "⚠️ <b>O arquivo enviado não parece ser um documento oficial legível.</b>\n\nEnvie uma foto nítida do seu RG, CNH ou documento oficial com foto.",
+                parse_mode=ParseMode.HTML,
+            )
+            return FOTO
+    except Exception as e:
+        logger.error(f"Erro ao validar documento localmente: {e}")
+        # Não trava o fluxo se a validação local falhar por erro de rede/download.
 
     await delete_last_step_message(update, context)
 
-    user = update.effective_user
     birth_date = context.user_data.get("birth_date", "não informado")
     age = context.user_data.get("age", "não informado")
     gender = context.user_data.get("gender", "não informado")
     username = f"@{user.username}" if user.username else "sem @username"
-    referral_code = context.user_data.get("referral_code", "")
 
     try:
         await context.bot.send_message(
@@ -580,7 +614,6 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
                 f"<b>Gênero:</b> {esc(gender)}\n"
                 f"<b>Data de nascimento:</b> <code>{esc(birth_date)}</code>\n"
                 f"<b>Idade:</b> {esc(age)} anos\n"
-                f"<b>Indicação:</b> {esc(referral_code) if referral_code else 'sem indicação'}\n"
                 "<b>Etapa recebida:</b> Documento"
             ),
             parse_mode=ParseMode.HTML,
@@ -619,6 +652,7 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
     return VIDEO
 
 
+@blocked_guard
 async def invalid_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "Envio inválido. Por favor, envie apenas uma imagem do seu documento.",
@@ -630,6 +664,7 @@ async def invalid_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # =========================
 # VÍDEO
 # =========================
+@blocked_guard
 async def receive_verification_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     video = update.message.video
 
@@ -640,7 +675,6 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
     age = context.user_data.get("age", "não informado")
     gender = context.user_data.get("gender", "não informado")
     username = f"@{user.username}" if user.username else "sem @username"
-    referral_code = context.user_data.get("referral_code", "")
 
     try:
         await context.bot.send_video(
@@ -653,8 +687,7 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
                 f"<b>ID:</b> <code>{user.id}</code>\n"
                 f"<b>Gênero:</b> {esc(gender)}\n"
                 f"<b>Data de nascimento:</b> <code>{esc(birth_date)}</code>\n"
-                f"<b>Idade:</b> {esc(age)} anos\n"
-                f"<b>Indicação:</b> {esc(referral_code) if referral_code else 'sem indicação'}\n\n"
+                f"<b>Idade:</b> {esc(age)} anos\n\n"
                 "<b>Ação:</b> escolha abaixo se deseja aprovar ou rejeitar."
             ),
             parse_mode=ParseMode.HTML,
@@ -665,15 +698,6 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
         )
     except Exception as e:
         logger.error(f"Erro ao enviar vídeo para o grupo: {e}")
-
-
-    if referral_code:
-        context.application.bot_data[f"referral_{user.id}"] = {
-            "code": referral_code,
-            "full_name": user.full_name or "",
-            "username": f"@{user.username}" if user.username else "",
-            "created_at": datetime.now().isoformat(),
-        }
 
     await update.message.reply_text(
         text=(
@@ -688,6 +712,7 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
     return ConversationHandler.END
 
 
+@blocked_guard
 async def invalid_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "Envio inválido. Por favor, envie apenas um arquivo de vídeo.",
@@ -705,12 +730,19 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
 
     data = query.data
 
+    if not is_admin_user(update.effective_user):
+        await query.answer("Você não tem permissão para executar esta ação.", show_alert=True)
+        return
+
     if data.startswith("approve_"):
         action = "approve"
         user_id = int(data.replace("approve_", "", 1))
     elif data.startswith("reject_"):
         action = "reject"
         user_id = int(data.replace("reject_", "", 1))
+    elif data.startswith("block_"):
+        action = "block"
+        user_id = int(data.replace("block_", "", 1))
     else:
         return
 
@@ -728,24 +760,12 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=support_keyboard(),
             )
 
-
-            referral_info = context.application.bot_data.pop(f"referral_{user_id}", {})
-            referral_code = str(referral_info.get("code", ""))
-            if referral_code:
-                await notify_site_referral_conversion(
-                    context=context,
-                    user_id=user_id,
-                    full_name=str(referral_info.get("full_name", "")),
-                    username=str(referral_info.get("username", "")),
-                    referral_code=referral_code,
-                )
-
             processed_text = (
                 "<b>Solicitação processada</b>\n\n"
                 "<b>Status:</b> ✅ Aprovada\n"
                 f"<b>Por:</b> {esc(admin_display)}"
             )
-        else:
+        elif action == "reject":
             await context.bot.send_message(
                 chat_id=user_id,
                 text="❌ <b>Infelizmente seu perfil não atende aos requisitos da nossa agência no momento.</b>",
@@ -755,6 +775,27 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
             processed_text = (
                 "<b>Solicitação processada</b>\n\n"
                 "<b>Status:</b> ❌ Rejeitada\n"
+                f"<b>Por:</b> {esc(admin_display)}"
+            )
+        else:
+            block_user(
+                user_id=user_id,
+                reason="Bloqueado pela administração durante a verificação.",
+                admin_user=update.effective_user,
+            )
+
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="🚫 <b>Seu acesso ao bot foi bloqueado pela administração.</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.error(f"Erro ao avisar usuário bloqueado: {e}")
+
+            processed_text = (
+                "<b>Solicitação processada</b>\n\n"
+                "<b>Status:</b> 🚫 Bloqueada\n"
                 f"<b>Por:</b> {esc(admin_display)}"
             )
 
@@ -772,6 +813,7 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
 # =========================
 # CANCELAMENTO
 # =========================
+@blocked_guard
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "❌ <b>Processo cancelado.</b>\n\nQuando quiser recomeçar, envie /start.",
@@ -781,6 +823,153 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cancel_pending_reminder(context)
     context.user_data.clear()
     return ConversationHandler.END
+
+
+
+
+# =========================
+# COMANDOS ADMIN
+# =========================
+async def admin_block_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+
+    if not is_admin_user(user):
+        await update.message.reply_text("Você não tem permissão para usar este comando.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Use: /bloquear ID_DO_USUARIO")
+        return
+
+    target_user_id = int(context.args[0])
+    block_user(
+        user_id=target_user_id,
+        reason="Bloqueado manualmente pela administração.",
+        admin_user=user,
+    )
+
+    await update.message.reply_text(
+        f"🚫 Usuário <code>{target_user_id}</code> bloqueado com sucesso.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def admin_unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+
+    if not is_admin_user(user):
+        await update.message.reply_text("Você não tem permissão para usar este comando.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Use: /desbloquear ID_DO_USUARIO")
+        return
+
+    target_user_id = int(context.args[0])
+    removed = unblock_user(target_user_id)
+
+    if removed:
+        await update.message.reply_text(
+            f"✅ Usuário <code>{target_user_id}</code> desbloqueado com sucesso.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"O usuário <code>{target_user_id}</code> não estava bloqueado.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def admin_blocked_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+
+    if not is_admin_user(user):
+        await update.message.reply_text("Você não tem permissão para usar este comando.")
+        return
+
+    blocked_users = load_blocked_users()
+
+    if not blocked_users:
+        await update.message.reply_text("Nenhum usuário bloqueado no momento.")
+        return
+
+    lines = ["🚫 <b>Usuários bloqueados</b>\n"]
+
+    for user_id, data in blocked_users.items():
+        lines.append(
+            f"<code>{esc(user_id)}</code> — {esc(data.get('reason', 'sem motivo'))} "
+            f"por {esc(data.get('blocked_by', 'admin'))}"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def admin_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+
+    if not is_admin_user(user):
+        await update.message.reply_text("Você não tem permissão para usar este comando.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Use: /addadmin ID_DO_ADMIN")
+        return
+
+    target_user_id = int(context.args[0])
+    add_admin(target_user_id)
+
+    await update.message.reply_text(
+        f"✅ Admin <code>{target_user_id}</code> adicionado com sucesso.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def admin_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+
+    if not is_admin_user(user):
+        await update.message.reply_text("Você não tem permissão para usar este comando.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Use: /deladmin ID_DO_ADMIN")
+        return
+
+    target_user_id = int(context.args[0])
+    removed = remove_admin(target_user_id)
+
+    if removed:
+        await update.message.reply_text(
+            f"✅ Admin <code>{target_user_id}</code> removido com sucesso.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"O ID <code>{target_user_id}</code> não estava na lista de admins extras.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def admin_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+
+    if not is_admin_user(user):
+        await update.message.reply_text("Você não tem permissão para usar este comando.")
+        return
+
+    admins = all_admin_ids()
+
+    if not admins:
+        await update.message.reply_text(
+            "Nenhum admin fixo configurado. Enquanto ADMIN_IDS estiver vazio, qualquer pessoa consegue usar comandos admin. Configure ADMIN_IDS no Render.",
+        )
+        return
+
+    lines = ["👑 <b>Admins do bot</b>\n"]
+    for admin_id in sorted(admins):
+        lines.append(f"<code>{admin_id}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # =========================
@@ -823,12 +1012,7 @@ async def main():
         states={
             TERMS: [
                 CallbackQueryHandler(show_terms, pattern="^start_verification$"),
-                CallbackQueryHandler(ask_referral, pattern="^agree_terms$"),
-            ],
-            INDICACAO: [
-                CallbackQueryHandler(referral_yes, pattern="^referral_yes$"),
-                CallbackQueryHandler(referral_no, pattern="^referral_no$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_referral_code),
+                CallbackQueryHandler(ask_gender, pattern="^agree_terms$"),
             ],
             GENERO: [
                 CallbackQueryHandler(receive_gender, pattern=r"^gender_.+"),
@@ -851,8 +1035,14 @@ async def main():
     )
 
     application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("bloquear", admin_block_command))
+    application.add_handler(CommandHandler("desbloquear", admin_unblock_command))
+    application.add_handler(CommandHandler("bloqueados", admin_blocked_list_command))
+    application.add_handler(CommandHandler("addadmin", admin_add_command))
+    application.add_handler(CommandHandler("deladmin", admin_remove_command))
+    application.add_handler(CommandHandler("admins", admin_list_command))
     application.add_handler(
-        CallbackQueryHandler(handle_admin_approval, pattern=r"^(approve|reject)_\d+$")
+        CallbackQueryHandler(handle_admin_approval, pattern=r"^(approve|reject|block)_\d+$")
     )
     application.add_error_handler(error_handler)
 

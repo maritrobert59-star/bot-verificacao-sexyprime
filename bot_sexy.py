@@ -848,11 +848,18 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
                 f"<b>Por:</b> {esc(admin_display)}"
             )
 
-        await query.edit_message_caption(
-            caption=processed_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=None,
-        )
+        if query.message and query.message.caption is not None:
+            await query.edit_message_caption(
+                caption=processed_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        elif query.message:
+            await query.edit_message_text(
+                text=processed_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
 
     except Exception as e:
         logger.error(f"Erro ao processar aprovação/rejeição: {e}")
@@ -935,6 +942,7 @@ async def main():
         allow_reentry=True,
     )
 
+    application.add_handler(CallbackQueryHandler(handle_admin_approval, pattern=r"^(approve|reject|block)_\d+$"), group=-1)
     application.add_handler(CommandHandler("meuid", my_id))
     application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(CommandHandler("addadmin", add_admin))
@@ -945,9 +953,6 @@ async def main():
     application.add_handler(CommandHandler("bloqueados", list_blocked))
     application.add_handler(CallbackQueryHandler(handle_admin_panel_callback, pattern=r"^panel_"))
     application.add_handler(conv_handler)
-    application.add_handler(
-        CallbackQueryHandler(handle_admin_approval, pattern=r"^(approve|reject|block)_\d+$")
-    )
     application.add_error_handler(error_handler)
 
     await application.initialize()

@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from typing import Final
 
+import aiohttp
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -25,6 +26,10 @@ from telegram.ext import (
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+REFERRAL_API_URL = os.getenv(
+    "REFERRAL_API_URL", "https://sxyprime.com/api/referral_bot.php"
+).strip()
+REFERRAL_API_KEY = os.getenv("REFERRAL_API_KEY", "").strip()
 
 LOG_GROUP_ID: Final[int] = -1003754061774
 SUPPORT_URL: Final[str] = "https://t.me/SXP_suporte"
@@ -34,7 +39,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 ADMIN_FILE: Final[str] = "admins.json"
 BLOCKED_FILE: Final[str] = "blocked_users.json"
 
-TERMS, GENERO, DATA, FOTO, VIDEO = range(5)
+TERMS, GENERO, INDICACAO, DATA, FOTO, VIDEO = range(6)
 
 DATE_REGEX: Final[re.Pattern[str]] = re.compile(
     r"^(0[1-9]|[12][0-9]|3[01])/(0[1-9]|1[0-2])/\d{4}$"
@@ -54,6 +59,23 @@ logger = logging.getLogger(__name__)
 # =========================
 def esc(text: object) -> str:
     return html.escape(str(text))
+
+
+async def referral_api(payload: dict) -> dict:
+    if not REFERRAL_API_KEY:
+        logger.error("REFERRAL_API_KEY não configurada no Render")
+        return {"ok": False, "error": "not_configured"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        headers = {"Authorization": f"Bearer {REFERRAL_API_KEY}"}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(REFERRAL_API_URL, json=payload, headers=headers) as response:
+                data = await response.json(content_type=None)
+                data["http_status"] = response.status
+                return data
+    except Exception as e:
+        logger.error(f"Erro na API de indicações: {e}")
+        return {"ok": False, "error": "unavailable"}
 
 
 def load_json_list(path: str) -> set[int]:
@@ -210,20 +232,27 @@ def gender_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def referral_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Não tenho código de indicação", callback_data="skip_referral")]
+    ])
+
+
 def support_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Suporte Sexy Prime", url=SUPPORT_URL)]
     ])
 
 
-def approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def approval_keyboard(user_id: int, referral_code: str = "") -> InlineKeyboardMarkup:
+    safe_code = re.sub(r"[^A-Z0-9]", "", referral_code.upper())[:32] or "NONE"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Aprovar", callback_data=f"approve_{user_id}"),
-            InlineKeyboardButton("❌ Rejeitar", callback_data=f"reject_{user_id}"),
+            InlineKeyboardButton("✅ Aprovar", callback_data=f"approve_{user_id}_{safe_code}"),
+            InlineKeyboardButton("❌ Rejeitar", callback_data=f"reject_{user_id}_{safe_code}"),
         ],
         [
-            InlineKeyboardButton("🚫 Bloquear", callback_data=f"block_{user_id}"),
+            InlineKeyboardButton("🚫 Bloquear", callback_data=f"block_{user_id}_{safe_code}"),
         ],
     ])
 
@@ -264,6 +293,9 @@ def admin_name(user) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
 
+    if context.args and context.args[0].startswith("ref_"):
+        context.user_data["pending_referral_code"] = context.args[0][4:].strip().upper()
+
     if await deny_if_blocked(update, context):
         return ConversationHandler.END
 
@@ -273,8 +305,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         text=(
             "🔒 <b>Verificação Oficial — Sexy Prime</b>\n\n"
-            f"Seja bem-vinda <b>{esc(nome)}</b> ao bot de verificação da agência <b>Sexy Prime</b>.\n\n"
-            "Este é o primeiro passo para sua oficialização em nossa agência."
+            f"Seja bem-vinda <b>{esc(nome)}</b> ao bot de verificação da plataforma <b>Sexy Prime</b>.\n\n"
+            "Este é o primeiro passo para sua verificação em nossa plataforma."
         ),
         reply_markup=start_keyboard(),
         parse_mode=ParseMode.HTML,
@@ -348,19 +380,88 @@ async def receive_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     gender = query.data.replace("gender_", "", 1)
     context.user_data["gender"] = gender
 
+    pending_code = context.user_data.pop("pending_referral_code", "")
+    if pending_code:
+        result = await referral_api({"action": "validate", "code": pending_code})
+        if result.get("ok") and result.get("valid"):
+            context.user_data["referral_code"] = result["code"]
+            context.user_data["referrer_model_name"] = result.get("model_name", "")
+            await query.edit_message_text(
+                text=(
+                    "✅ <b>Indicação identificada</b>\n\n"
+                    f"Você veio pela modelo <b>{esc(result.get('model_name', ''))}</b>.\n\n"
+                    "📅 <b>Etapa 3 de 5 — Data de Nascimento</b>\n\n"
+                    "Agora envie sua data de nascimento no formato abaixo:\n\n"
+                    "<code>01/01/2000</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            save_step_message_id_from_query(update, context)
+            schedule_pending_reminder(update, context)
+            return DATA
+
     await query.edit_message_text(
         text=(
-            "📅 <b>Etapa 2 de 4 — Data de Nascimento</b>\n\n"
+            "🎟 <b>Etapa 2 de 5 — Código de indicação</b>\n\n"
             f"<b>Gênero selecionado:</b> {esc(gender)}\n\n"
-            "Agora envie sua data de nascimento no formato abaixo:\n\n"
-            "<code>01/01/2000</code>"
+            "Se você veio por indicação de uma modelo da Sexy Prime, envie agora o "
+            "<b>código de indicação que aparece no site</b>.\n\n"
+            "Se não possui um código, toque no botão abaixo."
         ),
+        reply_markup=referral_keyboard(),
         parse_mode=ParseMode.HTML,
     )
 
     save_step_message_id_from_query(update, context)
     schedule_pending_reminder(update, context)
 
+    return INDICACAO
+
+
+async def ask_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        context.user_data["referral_code"] = "não informado"
+        await query.edit_message_text(
+            text=(
+                "📅 <b>Etapa 3 de 5 — Data de Nascimento</b>\n\n"
+                "Agora envie sua data de nascimento no formato abaixo:\n\n"
+                "<code>01/01/2000</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        save_step_message_id_from_query(update, context)
+    else:
+        code = update.message.text.strip().upper()
+        if len(code) > 100:
+            await update.message.reply_text("Código muito longo. Envie um código válido ou use o botão para pular.")
+            return INDICACAO
+        result = await referral_api({"action": "validate", "code": code})
+        if not result.get("ok") or not result.get("valid"):
+            if result.get("error") in {"unavailable", "not_configured"}:
+                message = "Não foi possível consultar o site agora. Tente novamente em alguns instantes."
+            else:
+                message = "❌ Código inválido ou inativo. Confira o código ou use o botão para continuar sem indicação."
+            await update.message.reply_text(message, reply_markup=referral_keyboard())
+            return INDICACAO
+        code = result["code"]
+        context.user_data["referral_code"] = code
+        context.user_data["referrer_model_name"] = result.get("model_name", "")
+        await delete_last_step_message(update, context)
+        msg = await update.message.reply_text(
+            text=(
+                "✅ <b>Código de indicação registrado:</b> " + esc(code) + "\n\n"
+                "<b>Modelo que indicou:</b> " + esc(result.get("model_name", "")) + "\n\n"
+                "📅 <b>Etapa 3 de 5 — Data de Nascimento</b>\n\n"
+                "Agora envie sua data de nascimento no formato abaixo:\n\n"
+                "<code>01/01/2000</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        context.user_data["last_step_message_id"] = msg.message_id
+
+    schedule_pending_reminder(update, context)
     return DATA
 
 
@@ -389,7 +490,7 @@ async def receive_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     msg = await update.message.reply_text(
         text=(
-            "🪪 <b>Etapa 3 de 4 — Documento</b>\n\n"
+            "🪪 <b>Etapa 4 de 5 — Documento</b>\n\n"
             "Agora envie uma <b>foto da sua identidade</b> para comprovar a idade.\n\n"
             "<i>Aceitamos apenas imagem nesta etapa.</i>"
         ),
@@ -424,6 +525,7 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
     birth_date = context.user_data.get("birth_date", "não informado")
     age = context.user_data.get("age", "não informado")
     gender = context.user_data.get("gender", "não informado")
+    referral_code = context.user_data.get("referral_code", "não informado")
     username = f"@{user.username}" if user.username else "sem @username"
 
     try:
@@ -435,6 +537,7 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
                 f"<b>Username:</b> {esc(username)}\n"
                 f"<b>ID:</b> <code>{user.id}</code>\n"
                 f"<b>Gênero:</b> {esc(gender)}\n"
+                f"<b>Código de indicação:</b> <code>{esc(referral_code)}</code>\n"
                 f"<b>Data de nascimento:</b> <code>{esc(birth_date)}</code>\n"
                 f"<b>Idade:</b> {esc(age)} anos\n"
                 "<b>Etapa recebida:</b> Documento"
@@ -460,9 +563,9 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
 
     msg = await update.message.reply_text(
         text=(
-            "🎥 <b>Etapa 4 de 4 — Vídeo de Confirmação</b>\n\n"
+            "🎥 <b>Etapa 5 de 5 — Vídeo de Confirmação</b>\n\n"
             "Agora envie um <b>vídeo seu</b> dizendo exatamente:\n\n"
-            "<code>Desejo ser verificada na agência Sexy Prime</code>\n\n"
+            "<code>Desejo ser verificada na plataforma Sexy Prime</code>\n\n"
             "<i>Aceitamos apenas vídeo nesta etapa.</i>"
         ),
         parse_mode=ParseMode.HTML,
@@ -498,6 +601,7 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
     birth_date = context.user_data.get("birth_date", "não informado")
     age = context.user_data.get("age", "não informado")
     gender = context.user_data.get("gender", "não informado")
+    referral_code = context.user_data.get("referral_code", "não informado")
     username = f"@{user.username}" if user.username else "sem @username"
 
     try:
@@ -510,12 +614,13 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
                 f"<b>Username:</b> {esc(username)}\n"
                 f"<b>ID:</b> <code>{user.id}</code>\n"
                 f"<b>Gênero:</b> {esc(gender)}\n"
+                f"<b>Código de indicação:</b> <code>{esc(referral_code)}</code>\n"
                 f"<b>Data de nascimento:</b> <code>{esc(birth_date)}</code>\n"
                 f"<b>Idade:</b> {esc(age)} anos\n\n"
                 "<b>Ação:</b> escolha abaixo se deseja aprovar ou rejeitar."
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=approval_keyboard(user.id),
+            reply_markup=approval_keyboard(user.id, str(referral_code)),
             read_timeout=180,
             write_timeout=180,
             connect_timeout=180,
@@ -782,24 +887,40 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Acesso negado.", show_alert=True)
         return
 
-    data = query.data
-
-    if data.startswith("approve_"):
-        action = "approve"
-        user_id = int(data.replace("approve_", "", 1))
-    elif data.startswith("reject_"):
-        action = "reject"
-        user_id = int(data.replace("reject_", "", 1))
-    elif data.startswith("block_"):
-        action = "block"
-        user_id = int(data.replace("block_", "", 1))
-    else:
+    match = re.fullmatch(r"(approve|reject|block)_(\d+)_([A-Z0-9]+)", query.data or "")
+    if not match:
         return
+    action, user_id_text, referral_code = match.groups()
+    user_id = int(user_id_text)
+    if referral_code == "NONE":
+        referral_code = ""
 
     admin_display = admin_name(update.effective_user)
 
     try:
         if action == "approve":
+            referral_status = ""
+            if referral_code:
+                try:
+                    referred_chat = await context.bot.get_chat(user_id)
+                    api_result = await referral_api({
+                        "action": "approve",
+                        "code": referral_code,
+                        "telegram_id": str(user_id),
+                        "name": referred_chat.full_name or "",
+                        "username": referred_chat.username or "",
+                        "payload": {"approved_by": admin_display},
+                    })
+                    if api_result.get("status") == "registered":
+                        referral_status = "\n<b>Indicação:</b> ✅ Registrada no site"
+                    elif api_result.get("status") == "already_registered":
+                        referral_status = "\n<b>Indicação:</b> Já estava registrada"
+                    else:
+                        referral_status = "\n<b>Indicação:</b> ⚠️ Não foi registrada; verifique os logs"
+                except Exception as e:
+                    logger.error(f"Erro ao registrar indicação aprovada: {e}")
+                    referral_status = "\n<b>Indicação:</b> ⚠️ Falha ao registrar no site"
+
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
@@ -814,11 +935,12 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
                 "<b>Solicitação processada</b>\n\n"
                 "<b>Status:</b> ✅ Aprovada\n"
                 f"<b>Por:</b> {esc(admin_display)}"
+                f"{referral_status}"
             )
         elif action == "reject":
             await context.bot.send_message(
                 chat_id=user_id,
-                text="❌ <b>Infelizmente seu perfil não atende aos requisitos da nossa agência no momento.</b>",
+                text="❌ <b>Infelizmente seu perfil não atende aos requisitos da nossa plataforma no momento.</b>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -925,6 +1047,10 @@ async def main():
             GENERO: [
                 CallbackQueryHandler(receive_gender, pattern=r"^gender_.+"),
             ],
+            INDICACAO: [
+                CallbackQueryHandler(ask_birth_date, pattern="^skip_referral$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_birth_date),
+            ],
             DATA: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_birth_date),
                 MessageHandler(~filters.TEXT, invalid_birth_date),
@@ -942,7 +1068,7 @@ async def main():
         allow_reentry=True,
     )
 
-    application.add_handler(CallbackQueryHandler(handle_admin_approval, pattern=r"^(approve|reject|block)_\d+$"), group=-1)
+    application.add_handler(CallbackQueryHandler(handle_admin_approval, pattern=r"^(approve|reject|block)_\d+_[A-Z0-9]+$"), group=-1)
     application.add_handler(CommandHandler("meuid", my_id))
     application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(CommandHandler("addadmin", add_admin))

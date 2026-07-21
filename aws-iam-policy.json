@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SexyPrimeOCR",
+      "Effect": "Allow",
+      "Action": [
+        "textract:DetectDocumentText"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SexyPrimeBiometria",
+      "Effect": "Allow",
+      "Action": [
+        "rekognition:DetectFaces",
+        "rekognition:CompareFaces"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

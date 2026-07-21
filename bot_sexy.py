@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from datetime import datetime
 from typing import Final
 
@@ -19,6 +20,12 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
+)
+
+from biometric_verification import (
+    analyze_document,
+    analyze_video,
+    automatic_recommendation,
 )
 
 # =========================
@@ -46,6 +53,7 @@ DATE_REGEX: Final[re.Pattern[str]] = re.compile(
 )
 
 PENDING_REMINDER_SECONDS: Final[int] = 900
+MINIMUM_AGE: Final[int] = int(os.getenv("MINIMUM_AGE", "20"))
 
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -245,7 +253,11 @@ def support_keyboard() -> InlineKeyboardMarkup:
 
 
 def approval_keyboard(user_id: int, referral_code: str = "") -> InlineKeyboardMarkup:
-    safe_code = re.sub(r"[^A-Z0-9]", "", referral_code.upper())[:32] or "NONE"
+    normalized_code = referral_code.strip().lower()
+    if normalized_code in {"", "não informado", "nao informado", "none"}:
+        safe_code = "NONE"
+    else:
+        safe_code = re.sub(r"[^A-Z0-9]", "", referral_code.upper())[:32] or "NONE"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Aprovar", callback_data=f"approve_{user_id}_{safe_code}"),
@@ -285,6 +297,46 @@ def admin_name(user) -> str:
     if user.full_name:
         return user.full_name
     return f"admin {user.id}"
+
+
+def check_icon(value: object) -> str:
+    if value is True:
+        return "✅"
+    if value is False:
+        return "❌"
+    return "⚠️"
+
+
+def format_ocr_report(result: dict) -> str:
+    if not result.get("available"):
+        return "<b>OCR:</b> ⚠️ Indisponível — conferir documento manualmente"
+
+    birth_date = result.get("birth_date") or "não identificada"
+    age = f"{result['age']} anos" if isinstance(result.get("age"), int) else "não identificada"
+    confidence = result.get("ocr_confidence", 0)
+    return (
+        f"<b>OCR/documento:</b> {check_icon(result.get('document_detected'))}\n"
+        f"<b>Nascimento lido:</b> <code>{esc(birth_date)}</code>\n"
+        f"<b>Idade pelo documento:</b> {esc(age)}\n"
+        f"<b>Confere com a data informada:</b> {check_icon(result.get('matches_declared'))}\n"
+        f"<b>Confiança média do OCR:</b> {esc(confidence)}%"
+    )
+
+
+def format_biometric_report(result: dict) -> str:
+    if not result.get("available"):
+        return "<b>Biometria:</b> ⚠️ Indisponível — comparar rostos manualmente"
+
+    similarity = result.get("similarity")
+    similarity_text = f"{similarity}%" if similarity is not None else "não calculada"
+    return (
+        f"<b>Rosto compatível:</b> {check_icon(result.get('face_match'))}\n"
+        f"<b>Similaridade facial:</b> {esc(similarity_text)} "
+        f"(mínimo {esc(result.get('threshold'))}%)\n"
+        f"<b>Rosto localizado:</b> {result.get('frames_with_face', 0)}/"
+        f"{result.get('frames_analyzed', 0)} quadros\n"
+        f"<b>Documento visível no vídeo:</b> {check_icon(result.get('document_visible'))}"
+    )
 
 
 # =========================
@@ -336,9 +388,10 @@ async def show_terms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "• Respeitar a equipe e demais modelos.\n"
             "• Seguir as orientações da administração.\n\n"
             "⚖️ <b>REQUISITOS LEGAIS</b>\n"
-            "• Ser maior de 18 anos.\n"
+            f"• Ter no mínimo {MINIMUM_AGE} anos completos.\n"
             "• Enviar documento oficial com foto.\n"
-            "• Enviar vídeo de confirmação conforme solicitado.\n\n"
+            "• Enviar vídeo com o documento ao lado do rosto.\n"
+            "• Autorizar a leitura do documento e a comparação biométrica para auxiliar a análise manual.\n\n"
             "Se você leu e concorda, clique no botão abaixo."
         ),
         reply_markup=terms_keyboard(),
@@ -486,13 +539,27 @@ async def receive_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["birth_date"] = date_text
     context.user_data["age"] = calculate_age(date_text)
 
+    if context.user_data["age"] < MINIMUM_AGE:
+        cancel_pending_reminder(context)
+        await update.message.reply_text(
+            text=(
+                "❌ <b>Você não atende à idade mínima da Sexy Prime.</b>\n\n"
+                f"A plataforma aceita somente modelos com {MINIMUM_AGE} anos completos ou mais."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
     schedule_pending_reminder(update, context)
 
     msg = await update.message.reply_text(
         text=(
             "🪪 <b>Etapa 4 de 5 — Documento</b>\n\n"
-            "Agora envie uma <b>foto da sua identidade</b> para comprovar a idade.\n\n"
-            "<i>Aceitamos apenas imagem nesta etapa.</i>"
+            "Agora envie uma <b>foto legível do seu RG ou documento oficial de identidade</b>.\n\n"
+            "A imagem deve mostrar o documento inteiro, sem cobrir a foto, o nome ou a data de nascimento. "
+            "Você pode enviar como foto ou como arquivo de imagem.\n\n"
+            "<i>O documento será lido por OCR e usado na comparação biométrica. A decisão final continuará sendo manual.</i>"
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -517,7 +584,9 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
     if await deny_if_blocked(update, context):
         return ConversationHandler.END
 
-    photo = update.message.photo[-1]
+    media = update.message.photo[-1] if update.message.photo else update.message.document
+    if not media:
+        return await invalid_document(update, context)
 
     await delete_last_step_message(update, context)
 
@@ -527,6 +596,19 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
     gender = context.user_data.get("gender", "não informado")
     referral_code = context.user_data.get("referral_code", "não informado")
     username = f"@{user.username}" if user.username else "sem @username"
+
+    try:
+        telegram_file = await context.bot.get_file(media.file_id)
+        document_bytes = bytes(await telegram_file.download_as_bytearray())
+        context.user_data["document_bytes"] = document_bytes
+        context.user_data["document_file_id"] = media.file_id
+        context.user_data["document_is_photo"] = bool(update.message.photo)
+        ocr_result = await analyze_document(document_bytes, str(birth_date))
+    except Exception as e:
+        logger.error(f"Erro ao baixar ou analisar o documento: {e}")
+        ocr_result = {"available": False, "reason": type(e).__name__}
+
+    context.user_data["ocr_result"] = ocr_result
 
     try:
         await context.bot.send_message(
@@ -539,34 +621,40 @@ async def receive_document_photo(update: Update, context: ContextTypes.DEFAULT_T
                 f"<b>Gênero:</b> {esc(gender)}\n"
                 f"<b>Código de indicação:</b> <code>{esc(referral_code)}</code>\n"
                 f"<b>Data de nascimento:</b> <code>{esc(birth_date)}</code>\n"
-                f"<b>Idade:</b> {esc(age)} anos\n"
-                "<b>Etapa recebida:</b> Documento"
+                f"<b>Idade informada:</b> {esc(age)} anos\n"
+                "<b>Etapa recebida:</b> Documento\n\n"
+                f"{format_ocr_report(ocr_result)}"
             ),
             parse_mode=ParseMode.HTML,
         )
 
-        await context.bot.send_photo(
-            chat_id=LOG_GROUP_ID,
-            photo=photo.file_id,
-            caption=(
+        media_kwargs = {
+            "chat_id": LOG_GROUP_ID,
+            "caption": (
                 "<b>Documento recebido</b>\n"
                 f"<b>Usuária:</b> {esc(user.full_name)}\n"
                 f"<b>ID:</b> <code>{user.id}</code>"
             ),
-            parse_mode=ParseMode.HTML,
-            read_timeout=60,
-            write_timeout=60,
-            connect_timeout=60,
-        )
+            "parse_mode": ParseMode.HTML,
+            "read_timeout": 60,
+            "write_timeout": 60,
+            "connect_timeout": 60,
+        }
+        if update.message.photo:
+            await context.bot.send_photo(photo=media.file_id, **media_kwargs)
+        else:
+            await context.bot.send_document(document=media.file_id, **media_kwargs)
     except Exception as e:
         logger.error(f"Erro ao enviar foto/documento para o grupo: {e}")
 
     msg = await update.message.reply_text(
         text=(
             "🎥 <b>Etapa 5 de 5 — Vídeo de Confirmação</b>\n\n"
-            "Agora envie um <b>vídeo seu</b> dizendo exatamente:\n\n"
+            "Agora grave um <b>vídeo atual, com seu rosto visível e segurando o mesmo documento ao lado do rosto</b>.\n\n"
+            "Durante o vídeo, diga exatamente:\n\n"
             "<code>Desejo ser verificada na plataforma Sexy Prime</code>\n\n"
-            "<i>Aceitamos apenas vídeo nesta etapa.</i>"
+            "Não cubra seu rosto nem a foto do documento. Use um local bem iluminado.\n\n"
+            "<i>Aceitamos apenas vídeo nesta etapa. A aprovação continuará sendo feita manualmente pela administração.</i>"
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -603,6 +691,37 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
     gender = context.user_data.get("gender", "não informado")
     referral_code = context.user_data.get("referral_code", "não informado")
     username = f"@{user.username}" if user.username else "sem @username"
+    document_bytes = context.user_data.get("document_bytes")
+    ocr_result = context.user_data.get("ocr_result", {"available": False})
+    biometric_result = {"available": False, "reason": "Documento não disponível na sessão"}
+    temp_video_path = None
+
+    if document_bytes:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
+                temp_video_path = temp_file.name
+            telegram_video = await context.bot.get_file(video.file_id)
+            await telegram_video.download_to_drive(temp_video_path)
+            biometric_result = await analyze_video(
+                document_bytes,
+                temp_video_path,
+                str(birth_date),
+            )
+        except Exception as e:
+            logger.error(f"Erro ao baixar ou analisar o vídeo: {e}")
+            biometric_result = {"available": False, "reason": type(e).__name__}
+        finally:
+            if temp_video_path:
+                try:
+                    os.unlink(temp_video_path)
+                except OSError:
+                    pass
+
+    recommendation = automatic_recommendation(
+        ocr_result,
+        biometric_result,
+        MINIMUM_AGE,
+    )
 
     try:
         await context.bot.send_video(
@@ -616,8 +735,12 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
                 f"<b>Gênero:</b> {esc(gender)}\n"
                 f"<b>Código de indicação:</b> <code>{esc(referral_code)}</code>\n"
                 f"<b>Data de nascimento:</b> <code>{esc(birth_date)}</code>\n"
-                f"<b>Idade:</b> {esc(age)} anos\n\n"
-                "<b>Ação:</b> escolha abaixo se deseja aprovar ou rejeitar."
+                f"<b>Idade informada:</b> {esc(age)} anos\n\n"
+                f"{format_ocr_report(ocr_result)}\n\n"
+                f"<b>ANÁLISE BIOMÉTRICA</b>\n"
+                f"{format_biometric_report(biometric_result)}\n\n"
+                f"<b>Resultado automático:</b> {recommendation}\n\n"
+                "<b>Decisão final:</b> escolha manualmente abaixo."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=approval_keyboard(user.id, str(referral_code)),
@@ -631,7 +754,8 @@ async def receive_verification_video(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_text(
         text=(
             "✅ <b>Verificação enviada!</b>\n\n"
-            "Seus dados foram encaminhados para análise. Aguarde a aprovação da nossa equipe."
+            "O documento e o vídeo foram analisados automaticamente e encaminhados para a decisão manual da equipe. "
+            "Aguarde a aprovação."
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -1056,8 +1180,8 @@ async def main():
                 MessageHandler(~filters.TEXT, invalid_birth_date),
             ],
             FOTO: [
-                MessageHandler(filters.PHOTO, receive_document_photo),
-                MessageHandler(~filters.PHOTO, invalid_document),
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_document_photo),
+                MessageHandler(~(filters.PHOTO | filters.Document.IMAGE), invalid_document),
             ],
             VIDEO: [
                 MessageHandler(filters.VIDEO, receive_verification_video),
